@@ -8,7 +8,85 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ace_util import get_pixel_grid
+
 _logger = logging.getLogger(__name__)
+
+
+class IntrinsicRayEncoding(nn.Module):
+    """Sinusoidal encoding of camera rays using image intrinsics."""
+
+    def __init__(self, feature_dim, subsampling_factor=8, scale=400.0):
+        super().__init__()
+
+        if feature_dim % 4 != 0:
+            raise ValueError("feature_dim must be divisible by 4 for sine/cosine encoding")
+
+        self.feature_dim = feature_dim
+        self.subsampling_factor = subsampling_factor
+        self.scale = scale
+
+        frequency = torch.exp(
+            torch.arange(0, feature_dim // 2, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / (feature_dim // 2))
+        )
+        self.register_buffer('frequency', frequency.view(1, -1), persistent=False)
+
+        pixel_grid = get_pixel_grid(subsampling_factor)
+        self.register_buffer('pixel_grid_2HW', pixel_grid, persistent=False)
+
+    def _encode_directions(self, x_scaled, y_scaled):
+        freq = self.frequency.to(x_scaled.dtype)
+
+        sin_x = torch.sin(x_scaled.unsqueeze(1) * freq)
+        cos_x = torch.cos(x_scaled.unsqueeze(1) * freq)
+        sin_y = torch.sin(y_scaled.unsqueeze(1) * freq)
+        cos_y = torch.cos(y_scaled.unsqueeze(1) * freq)
+
+        return torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
+
+    def encode_points(self, pixel_coords_b2, intrinsics_b33):
+        if pixel_coords_b2.shape[0] != intrinsics_b33.shape[0]:
+            raise ValueError("Pixel coordinate and intrinsics batches must have the same length")
+
+        x = pixel_coords_b2[:, 0]
+        y = pixel_coords_b2[:, 1]
+
+        fx = intrinsics_b33[:, 0, 0]
+        fy = intrinsics_b33[:, 1, 1]
+        cx = intrinsics_b33[:, 0, 2]
+        cy = intrinsics_b33[:, 1, 2]
+
+        x_scaled = (x - cx) / fx * self.scale
+        y_scaled = (y - cy) / fy * self.scale
+
+        return self._encode_directions(x_scaled, y_scaled)
+
+    def encode_grid(self, intrinsics_b33, spatial_size, dtype, device):
+        B = intrinsics_b33.shape[0]
+        H, W = spatial_size
+
+        grid = self.pixel_grid_2HW[:, :H, :W].to(device=device, dtype=dtype)
+
+        x = grid[0].unsqueeze(0).expand(B, -1, -1)
+        y = grid[1].unsqueeze(0).expand(B, -1, -1)
+
+        fx = intrinsics_b33[:, 0, 0].view(B, 1, 1)
+        fy = intrinsics_b33[:, 1, 1].view(B, 1, 1)
+        cx = intrinsics_b33[:, 0, 2].view(B, 1, 1)
+        cy = intrinsics_b33[:, 1, 2].view(B, 1, 1)
+
+        x_scaled = (x - cx) / fx * self.scale
+        y_scaled = (y - cy) / fy * self.scale
+
+        freq = self.frequency.view(1, -1, 1, 1).to(dtype=dtype, device=device)
+
+        sin_x = torch.sin(x_scaled.unsqueeze(1) * freq)
+        cos_x = torch.cos(x_scaled.unsqueeze(1) * freq)
+        sin_y = torch.sin(y_scaled.unsqueeze(1) * freq)
+        cos_y = torch.cos(y_scaled.unsqueeze(1) * freq)
+
+        return torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
 
 
 class Encoder(nn.Module):
@@ -172,7 +250,20 @@ class Regressor(nn.Module):
         self.feature_dim = num_encoder_features
 
         self.encoder = Encoder(out_channels=self.feature_dim)
+        self.ray_encoder = IntrinsicRayEncoding(self.feature_dim, self.OUTPUT_SUBSAMPLE)
         self.heads = Head(mean, num_head_blocks, use_homogeneous, in_channels=self.feature_dim)
+
+    def _fuse_intrinsics(self, features, intrinsics):
+        if intrinsics is None:
+            return features
+
+        ray_encoding = self.ray_encoder.encode_grid(
+            intrinsics,
+            spatial_size=features.shape[-2:],
+            dtype=features.dtype,
+            device=features.device,
+        )
+        return features + ray_encoding
 
     @classmethod
     def create_from_encoder(cls, encoder_state_dict, mean, num_head_blocks, use_homogeneous):
@@ -256,15 +347,16 @@ class Regressor(nn.Module):
         """
         self.encoder.load_state_dict(torch.load(encoder_dict_file))
 
-    def get_features(self, inputs):
-        return self.encoder(inputs)
+    def get_features(self, inputs, intrinsics=None):
+        features = self.encoder(inputs)
+        return self._fuse_intrinsics(features, intrinsics)
 
     def get_scene_coordinates(self, features):
         return self.heads(features)
 
-    def forward(self, inputs):
+    def forward(self, inputs, intrinsics=None):
         """
         Forward pass.
         """
-        features = self.get_features(inputs)
+        features = self.get_features(inputs, intrinsics)
         return self.get_scene_coordinates(features)

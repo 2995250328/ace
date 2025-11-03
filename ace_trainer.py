@@ -277,7 +277,7 @@ class TrainerACE:
 
                     # Compute image features.
                     with autocast(enabled=self.options.use_half):
-                        features_BCHW = self.regressor.get_features(image_B1HW)
+                        features_BCHW = self.regressor.get_features(image_B1HW, intrinsics_B33)
 
                     # Dimensions after the network's downsampling.
                     B, C, H, W = features_BCHW.shape

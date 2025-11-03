@@ -193,10 +193,11 @@ if __name__ == '__main__':
             batch_size = image_B1HW.shape[0]
 
             image_B1HW = image_B1HW.to(device, non_blocking=True)
+            intrinsics_B33_gpu = intrinsics_B33.to(device, non_blocking=True)
 
             # Predict scene coordinates.
             with autocast(enabled=True):
-                scene_coordinates_B3HW = network(image_B1HW)
+                scene_coordinates_B3HW = network(image_B1HW, intrinsics_B33_gpu)
 
             # We need them on the CPU to run RANSAC.
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()

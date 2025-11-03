@@ -20,6 +20,11 @@ from dataset import CamLocDataset
 import ace_vis_util as vutil
 from ace_visualizer import ACEVisualizer
 
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    tqdm = None
+
 _logger = logging.getLogger(__name__)
 
 
@@ -94,7 +99,8 @@ class TrainerACE:
             encoder_state_dict,
             mean=self.dataset.mean_cam_center,
             num_head_blocks=self.options.num_head_blocks,
-            use_homogeneous=self.options.use_homogeneous
+            use_homogeneous=self.options.use_homogeneous,
+            intrinsics_fusion_mode=getattr(self.options, 'intrinsics_fusion', 'add'),
         )
         _logger.info(f"Loaded pretrained encoder from: {self.options.encoder_path}")
 
@@ -116,7 +122,11 @@ class TrainerACE:
         self.scaler = GradScaler(enabled=self.options.use_half)
 
         # Generate grid of target reprojection pixel positions.
-        pixel_grid_2HW = get_pixel_grid(self.regressor.OUTPUT_SUBSAMPLE)
+        pixel_grid_2HW = get_pixel_grid(
+            self.regressor.OUTPUT_SUBSAMPLE,
+            show_progress=True,
+            desc="Preparing pixel grid for training",
+        )
         self.pixel_grid_2HW = pixel_grid_2HW.to(self.device)
 
         # Compute total number of iterations.
@@ -241,6 +251,7 @@ class TrainerACE:
                                          )
 
         _logger.info("Starting creation of the training buffer.")
+        progress_bar = tqdm(total=self.options.training_buffer_size, desc="Filling training buffer", unit="sample", leave=False) if tqdm is not None else None
 
         # Create a training buffer that lives on the GPU.
         self.training_buffer = {
@@ -264,83 +275,89 @@ class TrainerACE:
             buffer_idx = 0
             dataset_passes = 0
 
-            while buffer_idx < self.options.training_buffer_size:
-                dataset_passes += 1
-                for image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
+            try:
+                while buffer_idx < self.options.training_buffer_size:
+                    dataset_passes += 1
+                    for image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
 
-                    # Copy to device.
-                    image_B1HW = image_B1HW.to(self.device, non_blocking=True)
-                    image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
-                    gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
-                    intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
-                    intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
+                        # Copy to device.
+                        image_B1HW = image_B1HW.to(self.device, non_blocking=True)
+                        image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
+                        gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
+                        intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
+                        intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
 
-                    # Compute image features.
-                    with autocast(enabled=self.options.use_half):
-                        features_BCHW = self.regressor.get_features(image_B1HW, intrinsics_B33)
+                        # Compute image features.
+                        with autocast(enabled=self.options.use_half):
+                            features_BCHW = self.regressor.get_features(image_B1HW, intrinsics_B33)
 
-                    # Dimensions after the network's downsampling.
-                    B, C, H, W = features_BCHW.shape
+                        # Dimensions after the network's downsampling.
+                        B, C, H, W = features_BCHW.shape
 
-                    # The image_mask needs to be downsampled to the actual output resolution and cast to bool.
-                    image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
-                    image_mask_B1HW = image_mask_B1HW.bool()
+                        # The image_mask needs to be downsampled to the actual output resolution and cast to bool.
+                        image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
+                        image_mask_B1HW = image_mask_B1HW.bool()
 
-                    # If the current mask has no valid pixels, continue.
-                    if image_mask_B1HW.sum() == 0:
-                        continue
+                        # If the current mask has no valid pixels, continue.
+                        if image_mask_B1HW.sum() == 0:
+                            continue
 
-                    # Create a tensor with the pixel coordinates of every feature vector.
-                    pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone()  # It's 2xHxW (actual H and W) now.
-                    pixel_positions_B2HW = pixel_positions_B2HW[None]  # 1x2xHxW
-                    pixel_positions_B2HW = pixel_positions_B2HW.expand(B, 2, H, W)  # Bx2xHxW
+                        # Create a tensor with the pixel coordinates of every feature vector.
+                        pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone()  # It's 2xHxW (actual H and W) now.
+                        pixel_positions_B2HW = pixel_positions_B2HW[None]  # 1x2xHxW
+                        pixel_positions_B2HW = pixel_positions_B2HW.expand(B, 2, H, W)  # Bx2xHxW
 
-                    # Bx3x4 -> Nx3x4 (for each image, repeat pose per feature)
-                    gt_pose_inv = gt_pose_inv_B44[:, :3]
-                    gt_pose_inv = gt_pose_inv.unsqueeze(1).expand(B, H * W, 3, 4).reshape(-1, 3, 4)
+                        # Bx3x4 -> Nx3x4 (for each image, repeat pose per feature)
+                        gt_pose_inv = gt_pose_inv_B44[:, :3]
+                        gt_pose_inv = gt_pose_inv.unsqueeze(1).expand(B, H * W, 3, 4).reshape(-1, 3, 4)
 
-                    # Bx3x3 -> Nx3x3 (for each image, repeat intrinsics per feature)
-                    intrinsics = intrinsics_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
-                    intrinsics_inv = intrinsics_inv_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
+                        # Bx3x3 -> Nx3x3 (for each image, repeat intrinsics per feature)
+                        intrinsics = intrinsics_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
+                        intrinsics_inv = intrinsics_inv_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
 
-                    def normalize_shape(tensor_in):
-                        """Bring tensor from shape BxCxHxW to NxC"""
-                        return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
+                        def normalize_shape(tensor_in):
+                            """Bring tensor from shape BxCxHxW to NxC"""
+                            return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
 
-                    batch_data = {
-                        'features': normalize_shape(features_BCHW),
-                        'target_px': normalize_shape(pixel_positions_B2HW),
-                        'gt_poses_inv': gt_pose_inv,
-                        'intrinsics': intrinsics,
-                        'intrinsics_inv': intrinsics_inv
-                    }
+                        batch_data = {
+                            'features': normalize_shape(features_BCHW),
+                            'target_px': normalize_shape(pixel_positions_B2HW),
+                            'gt_poses_inv': gt_pose_inv,
+                            'intrinsics': intrinsics,
+                            'intrinsics_inv': intrinsics_inv
+                        }
 
-                    # Turn image mask into sampling weights (all equal).
-                    image_mask_B1HW = image_mask_B1HW.float()
-                    image_mask_N1 = normalize_shape(image_mask_B1HW)
+                        # Turn image mask into sampling weights (all equal).
+                        image_mask_B1HW = image_mask_B1HW.float()
+                        image_mask_N1 = normalize_shape(image_mask_B1HW)
 
-                    # Over-sample according to image mask.
-                    features_to_select = self.options.samples_per_image * B
-                    features_to_select = min(features_to_select, self.options.training_buffer_size - buffer_idx)
+                        # Over-sample according to image mask.
+                        features_to_select = self.options.samples_per_image * B
+                        features_to_select = min(features_to_select, self.options.training_buffer_size - buffer_idx)
 
-                    # Sample indices uniformly, with replacement.
-                    sample_idxs = torch.multinomial(image_mask_N1.view(-1),
-                                                    features_to_select,
-                                                    replacement=True,
-                                                    generator=self.sampling_generator)
+                        # Sample indices uniformly, with replacement.
+                        sample_idxs = torch.multinomial(image_mask_N1.view(-1),
+                                                        features_to_select,
+                                                        replacement=True,
+                                                        generator=self.sampling_generator)
 
-                    # Select the data to put in the buffer.
-                    for k in batch_data:
-                        batch_data[k] = batch_data[k][sample_idxs]
+                        # Select the data to put in the buffer.
+                        for k in batch_data:
+                            batch_data[k] = batch_data[k][sample_idxs]
 
-                    # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
-                    buffer_offset = buffer_idx + features_to_select
-                    for k in batch_data:
-                        self.training_buffer[k][buffer_idx:buffer_offset] = batch_data[k]
+                        # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
+                        buffer_offset = buffer_idx + features_to_select
+                        for k in batch_data:
+                            self.training_buffer[k][buffer_idx:buffer_offset] = batch_data[k]
 
-                    buffer_idx = buffer_offset
-                    if buffer_idx >= self.options.training_buffer_size:
-                        break
+                        buffer_idx = buffer_offset
+                        if progress_bar is not None:
+                            progress_bar.update(features_to_select)
+                        if buffer_idx >= self.options.training_buffer_size:
+                            break
+            finally:
+                if progress_bar is not None:
+                    progress_bar.close()
 
         buffer_memory = sum([v.element_size() * v.nelement() for k, v in self.training_buffer.items()])
         buffer_memory /= 1024 * 1024 * 1024

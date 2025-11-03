@@ -6,6 +6,7 @@ import logging
 from distutils.util import strtobool
 from pathlib import Path
 
+from ace_network import IntrinsicFusion
 from ace_trainer import TrainerACE
 
 
@@ -120,6 +121,10 @@ if __name__ == '__main__':
 
     parser.add_argument('--render_camera_z_offset', type=int, default=4,
                         help='zoom out of the scene by moving render camera backwards, in meters')
+
+    parser.add_argument('--intrinsics_fusion', type=str, default='add',
+                        choices=IntrinsicFusion.AVAILABLE_MODES,
+                        help='strategy used to fuse intrinsic encodings with backbone features during training')
 
     options = parser.parse_args()
 

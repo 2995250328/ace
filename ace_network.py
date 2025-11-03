@@ -32,7 +32,11 @@ class IntrinsicRayEncoding(nn.Module):
         )
         self.register_buffer('frequency', frequency.view(1, -1), persistent=False)
 
-        pixel_grid = get_pixel_grid(subsampling_factor)
+        pixel_grid = get_pixel_grid(
+            subsampling_factor,
+            show_progress=True,
+            desc="Precomputing intrinsic ray grid",
+        )
         self.register_buffer('pixel_grid_2HW', pixel_grid, persistent=False)
 
     def _encode_directions(self, x_scaled, y_scaled):
@@ -44,6 +48,78 @@ class IntrinsicRayEncoding(nn.Module):
         cos_y = torch.cos(y_scaled.unsqueeze(1) * freq)
 
         return torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
+
+
+class IntrinsicFusion(nn.Module):
+    """Fuse backbone features with intrinsic ray encodings using different strategies."""
+
+    AVAILABLE_MODES = ("add", "concat_conv", "gated_add", "film")
+
+    def __init__(self, feature_dim, mode="add"):
+        super().__init__()
+
+        self.feature_dim = feature_dim
+        self.mode_modules = nn.ModuleDict()
+        self.mode = None
+
+        self.set_mode(mode)
+
+    def set_mode(self, mode):
+        if mode not in self.AVAILABLE_MODES:
+            raise ValueError(f"Unsupported fusion mode '{mode}'. Supported modes: {self.AVAILABLE_MODES}")
+
+        self.mode = mode
+
+        if mode == "concat_conv":
+            self._ensure_concat_conv()
+        elif mode == "gated_add":
+            self._ensure_gated_add()
+        elif mode == "film":
+            self._ensure_film()
+
+    def _ensure_concat_conv(self):
+        if "concat_conv" not in self.mode_modules:
+            self.mode_modules["concat_conv"] = nn.Sequential(
+                nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1, bias=False),
+                nn.BatchNorm2d(self.feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            )
+        return self.mode_modules["concat_conv"]
+
+    def _ensure_gated_add(self):
+        if "gated_add" not in self.mode_modules:
+            self.mode_modules["gated_add"] = nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1)
+        return self.mode_modules["gated_add"]
+
+    def _ensure_film(self):
+        if "film" not in self.mode_modules:
+            self.mode_modules["film"] = nn.ModuleDict({
+                "scale": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+                "shift": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            })
+        return self.mode_modules["film"]
+
+    def forward(self, features, encoding):
+        if self.mode == "add":
+            return features + encoding
+
+        if self.mode == "concat_conv":
+            module = self._ensure_concat_conv()
+            return module(torch.cat([features, encoding], dim=1))
+
+        if self.mode == "gated_add":
+            gate_conv = self._ensure_gated_add()
+            gate = torch.sigmoid(gate_conv(torch.cat([features, encoding], dim=1)))
+            return features + gate * encoding
+
+        if self.mode == "film":
+            film = self._ensure_film()
+            scale = torch.sigmoid(film["scale"](encoding))
+            shift = film["shift"](encoding)
+            return features * scale + shift
+
+        raise RuntimeError(f"Unhandled fusion mode '{self.mode}'")
 
     def encode_points(self, pixel_coords_b2, intrinsics_b33):
         if pixel_coords_b2.shape[0] != intrinsics_b33.shape[0]:
@@ -236,7 +312,14 @@ class Regressor(nn.Module):
 
     OUTPUT_SUBSAMPLE = 8
 
-    def __init__(self, mean, num_head_blocks, use_homogeneous, num_encoder_features=512):
+    def __init__(
+        self,
+        mean,
+        num_head_blocks,
+        use_homogeneous,
+        num_encoder_features=512,
+        intrinsics_fusion_mode="add",
+    ):
         """
         Constructor.
 
@@ -251,7 +334,12 @@ class Regressor(nn.Module):
 
         self.encoder = Encoder(out_channels=self.feature_dim)
         self.ray_encoder = IntrinsicRayEncoding(self.feature_dim, self.OUTPUT_SUBSAMPLE)
+        self.intrinsics_fusion = IntrinsicFusion(self.feature_dim, intrinsics_fusion_mode)
         self.heads = Head(mean, num_head_blocks, use_homogeneous, in_channels=self.feature_dim)
+
+    @property
+    def intrinsics_fusion_mode(self):
+        return self.intrinsics_fusion.mode
 
     def _fuse_intrinsics(self, features, intrinsics):
         if intrinsics is None:
@@ -263,10 +351,20 @@ class Regressor(nn.Module):
             dtype=features.dtype,
             device=features.device,
         )
-        return features + ray_encoding
+        return self.intrinsics_fusion(features, ray_encoding)
+
+    def set_intrinsics_fusion_mode(self, mode):
+        self.intrinsics_fusion.set_mode(mode)
 
     @classmethod
-    def create_from_encoder(cls, encoder_state_dict, mean, num_head_blocks, use_homogeneous):
+    def create_from_encoder(
+        cls,
+        encoder_state_dict,
+        mean,
+        num_head_blocks,
+        use_homogeneous,
+        intrinsics_fusion_mode="add",
+    ):
         """
         Create a regressor using a pretrained encoder, loading encoder-specific parameters from the state dict.
 
@@ -280,8 +378,13 @@ class Regressor(nn.Module):
         num_encoder_features = encoder_state_dict['res2_conv3.weight'].shape[0]
 
         # Create a regressor.
-        _logger.info(f"Creating Regressor using pretrained encoder with {num_encoder_features} feature size.")
-        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features)
+        _logger.info(
+            "Creating Regressor using pretrained encoder with %s feature size and '%s' fusion.",
+            num_encoder_features,
+            intrinsics_fusion_mode,
+        )
+
+        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features, intrinsics_fusion_mode)
 
         # Load encoder weights.
         regressor.encoder.load_state_dict(encoder_state_dict)
@@ -290,7 +393,17 @@ class Regressor(nn.Module):
         return regressor
 
     @classmethod
-    def create_from_state_dict(cls, state_dict):
+    def _detect_intrinsics_fusion_mode(state_dict):
+        if any(k.startswith("intrinsics_fusion.mode_modules.film") for k in state_dict):
+            return "film"
+        if any(k.startswith("intrinsics_fusion.mode_modules.gated_add") for k in state_dict):
+            return "gated_add"
+        if any(k.startswith("intrinsics_fusion.mode_modules.concat_conv") for k in state_dict):
+            return "concat_conv"
+        return "add"
+
+    @classmethod
+    def create_from_state_dict(cls, state_dict, intrinsics_fusion_mode=None):
         """
         Instantiate a regressor from a pretrained state dictionary.
 
@@ -310,20 +423,37 @@ class Regressor(nn.Module):
         num_encoder_features = state_dict['encoder.res2_conv3.weight'].shape[0]
 
         # Create a regressor.
-        _logger.info(f"Creating regressor from pretrained state_dict:"
-                     f"\n\tNum head blocks: {num_head_blocks}"
-                     f"\n\tHomogeneous coordinates: {use_homogeneous}"
-                     f"\n\tEncoder feature size: {num_encoder_features}")
-        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features)
+        detected_mode = cls._detect_intrinsics_fusion_mode(state_dict)
+        fusion_mode = intrinsics_fusion_mode or detected_mode
+
+        _logger.info(
+            "Creating regressor from pretrained state_dict:\n\tNum head blocks: %s\n\tHomogeneous coordinates: %s\n\tEncoder feature size: %s\n\tIntrinsics fusion: %s",
+            num_head_blocks,
+            use_homogeneous,
+            num_encoder_features,
+            fusion_mode,
+        )
+
+        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features, fusion_mode)
 
         # Load all weights.
-        regressor.load_state_dict(state_dict)
+        strict_load = not (intrinsics_fusion_mode and fusion_mode != detected_mode)
+        load_result = regressor.load_state_dict(state_dict, strict=strict_load)
+        if load_result.missing_keys:
+            _logger.debug("Missing keys while loading regressor: %s", load_result.missing_keys)
+        if load_result.unexpected_keys:
+            _logger.debug("Unexpected keys while loading regressor: %s", load_result.unexpected_keys)
 
         # Done.
         return regressor
 
     @classmethod
-    def create_from_split_state_dict(cls, encoder_state_dict, head_state_dict):
+    def create_from_split_state_dict(
+        cls,
+        encoder_state_dict,
+        head_state_dict,
+        intrinsics_fusion_mode=None,
+    ):
         """
         Instantiate a regressor from a pretrained encoder (scene-agnostic) and a scene-specific head.
 
@@ -339,7 +469,10 @@ class Regressor(nn.Module):
         for k, v in head_state_dict.items():
             merged_state_dict[f"heads.{k}"] = v
 
-        return cls.create_from_state_dict(merged_state_dict)
+        if intrinsics_fusion_mode == "auto":
+            intrinsics_fusion_mode = None
+
+        return cls.create_from_state_dict(merged_state_dict, intrinsics_fusion_mode)
 
     def load_encoder(self, encoder_dict_file):
         """

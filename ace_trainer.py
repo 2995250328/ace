@@ -122,11 +122,7 @@ class TrainerACE:
         self.scaler = GradScaler(enabled=self.options.use_half)
 
         # Generate grid of target reprojection pixel positions.
-        pixel_grid_2HW = get_pixel_grid(
-            self.regressor.OUTPUT_SUBSAMPLE,
-            show_progress=True,
-            desc="Preparing pixel grid for training",
-        )
+        pixel_grid_2HW = get_pixel_grid(self.regressor.OUTPUT_SUBSAMPLE)
         self.pixel_grid_2HW = pixel_grid_2HW.to(self.device)
 
         # Compute total number of iterations.
@@ -251,7 +247,14 @@ class TrainerACE:
                                          )
 
         _logger.info("Starting creation of the training buffer.")
-        progress_bar = tqdm(total=self.options.training_buffer_size, desc="Filling training buffer", unit="sample", leave=False) if tqdm is not None else None
+        progress_bar = None
+        if tqdm is not None:
+            progress_bar = tqdm(
+                total=self.options.training_buffer_size,
+                desc="Filling training buffer",
+                unit="sample",
+                leave=False,
+            )
 
         # Create a training buffer that lives on the GPU.
         self.training_buffer = {

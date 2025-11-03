@@ -32,11 +32,7 @@ class IntrinsicRayEncoding(nn.Module):
         )
         self.register_buffer('frequency', frequency.view(1, -1), persistent=False)
 
-        pixel_grid = get_pixel_grid(
-            subsampling_factor,
-            show_progress=True,
-            desc="Precomputing intrinsic ray grid",
-        )
+        pixel_grid = get_pixel_grid(subsampling_factor)
         self.register_buffer('pixel_grid_2HW', pixel_grid, persistent=False)
 
     def _encode_directions(self, x_scaled, y_scaled):

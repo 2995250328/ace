@@ -1,28 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -lt 2 ]; then
-  echo "Usage: $0 <scene_path> <output_dir> [train_ace.py args...]" >&2
-  echo "Example: $0 datasets/Cambridge_GreatCourt outputs --epochs 8" >&2
-  exit 1
-fi
+SCENE=$1
+OUT=$2
+shift 2
 
-SCENE_PATH=$1
-shift
-OUTPUT_DIR=$1
-shift
+MODES=(
+  "residual_concat"
+  "film_residual"
+  "star_block_conv"
+  "att_channel"
+  "att_spatial"
+  "att_cross"
+)
 
-mkdir -p "${OUTPUT_DIR}"
+GPUS=(0 1)
+MAX_JOBS=${#GPUS[@]}
 
-MODES=("add" "concat_conv" "gated_add" "film")
-SCENE_NAME=$(basename "${SCENE_PATH}")
+job_count=0
 
 for MODE in "${MODES[@]}"; do
-  SAVE_PATH="${OUTPUT_DIR}/${SCENE_NAME}_${MODE}.pt"
-  echo "[train_intrinsics_fusion_sweep] Training mode '${MODE}' -> ${SAVE_PATH}" >&2
-  python train_ace.py "${SCENE_PATH}" "${SAVE_PATH}" --intrinsics_fusion "${MODE}" "$@"
-  echo "[train_intrinsics_fusion_sweep] Finished mode '${MODE}'." >&2
-  echo >&2
+  GPU=${GPUS[$(( job_count % MAX_JOBS ))]}
+  SAVE="${OUT}/$(basename $SCENE)_${MODE}.pt"
+  LOG="${OUT}/${MODE}.log"
+
+  echo "[QUEUE] GPU${GPU} → ${MODE}"
+
+  (
+    export CUDA_VISIBLE_DEVICES=$GPU
+    python train_ace.py "$SCENE" "$SAVE" \
+      --intrinsics_fusion "$MODE" "$@" \
+      > "$LOG" 2>&1
+  ) &
+
+  job_count=$((job_count + 1))
+
+  if (( job_count % MAX_JOBS == 0 )); then
+    echo "[QUEUE] 等待当前 2 进程训练结束..."
+    wait
+  fi
 done
 
-echo "[train_intrinsics_fusion_sweep] All modes completed. Models saved in ${OUTPUT_DIR}." >&2
+wait
+echo "[QUEUE] ✅ 全部训练完成"

@@ -45,78 +45,6 @@ class IntrinsicRayEncoding(nn.Module):
 
         return torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
 
-
-class IntrinsicFusion(nn.Module):
-    """Fuse backbone features with intrinsic ray encodings using different strategies."""
-
-    AVAILABLE_MODES = ("add", "concat_conv", "gated_add", "film")
-
-    def __init__(self, feature_dim, mode="add"):
-        super().__init__()
-
-        self.feature_dim = feature_dim
-        self.mode_modules = nn.ModuleDict()
-        self.mode = None
-
-        self.set_mode(mode)
-
-    def set_mode(self, mode):
-        if mode not in self.AVAILABLE_MODES:
-            raise ValueError(f"Unsupported fusion mode '{mode}'. Supported modes: {self.AVAILABLE_MODES}")
-
-        self.mode = mode
-
-        if mode == "concat_conv":
-            self._ensure_concat_conv()
-        elif mode == "gated_add":
-            self._ensure_gated_add()
-        elif mode == "film":
-            self._ensure_film()
-
-    def _ensure_concat_conv(self):
-        if "concat_conv" not in self.mode_modules:
-            self.mode_modules["concat_conv"] = nn.Sequential(
-                nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1, bias=False),
-                nn.BatchNorm2d(self.feature_dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
-            )
-        return self.mode_modules["concat_conv"]
-
-    def _ensure_gated_add(self):
-        if "gated_add" not in self.mode_modules:
-            self.mode_modules["gated_add"] = nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1)
-        return self.mode_modules["gated_add"]
-
-    def _ensure_film(self):
-        if "film" not in self.mode_modules:
-            self.mode_modules["film"] = nn.ModuleDict({
-                "scale": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
-                "shift": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
-            })
-        return self.mode_modules["film"]
-
-    def forward(self, features, encoding):
-        if self.mode == "add":
-            return features + encoding
-
-        if self.mode == "concat_conv":
-            module = self._ensure_concat_conv()
-            return module(torch.cat([features, encoding], dim=1))
-
-        if self.mode == "gated_add":
-            gate_conv = self._ensure_gated_add()
-            gate = torch.sigmoid(gate_conv(torch.cat([features, encoding], dim=1)))
-            return features + gate * encoding
-
-        if self.mode == "film":
-            film = self._ensure_film()
-            scale = torch.sigmoid(film["scale"](encoding))
-            shift = film["shift"](encoding)
-            return features * scale + shift
-
-        raise RuntimeError(f"Unhandled fusion mode '{self.mode}'")
-
     def encode_points(self, pixel_coords_b2, intrinsics_b33):
         if pixel_coords_b2.shape[0] != intrinsics_b33.shape[0]:
             raise ValueError("Pixel coordinate and intrinsics batches must have the same length")
@@ -159,6 +87,224 @@ class IntrinsicFusion(nn.Module):
         cos_y = torch.cos(y_scaled.unsqueeze(1) * freq)
 
         return torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
+
+from timm.models.layers import DropPath
+
+class StarBlockConv(nn.Module):
+    """Conv-based STAR block for feature maps [B,C,H,W]"""
+    def __init__(self, dim, mlp_ratio=3, drop_path=0.):
+        super().__init__()
+        hidden_dim = dim * mlp_ratio
+
+        self.norm = nn.BatchNorm2d(dim)
+
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, dim, 1),
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, 1),
+            nn.Sigmoid(),
+            nn.Conv2d(hidden_dim, dim, 1),
+        )
+
+        self.mix = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 1),
+        )
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm(x)
+
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+
+        x = x1 * x2
+        x = self.mix(x)
+
+        return shortcut + self.drop_path(x)
+
+
+class ChannelAttentionFuse(nn.Module):
+    def __init__(self, dim, reduction=4):
+        super().__init__()
+        hidden = dim // reduction
+        self.mlp = nn.Sequential(
+            nn.Conv2d(dim, hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, feat, enc):
+        w = self.mlp(enc)
+        return feat * (1 + w)
+
+
+class SpatialAttentionFuse(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, 1, 3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, feat, enc):
+        avg = torch.mean(enc, dim=1, keepdim=True)
+        maxv, _ = torch.max(enc, dim=1, keepdim=True)
+        att = self.conv(torch.cat([avg, maxv], dim=1))
+        return feat + feat * att
+
+
+class CrossAttentionFuse(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q = nn.Conv2d(dim, dim, 1)
+        self.k = nn.Conv2d(dim, dim, 1)
+        self.v = nn.Conv2d(dim, dim, 1)
+        self.proj = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, feat, enc):
+        B, C, H, W = feat.shape
+        q = self.q(enc).reshape(B, self.num_heads, self.head_dim, H*W)
+        k = self.k(feat).reshape(B, self.num_heads, self.head_dim, H*W)
+        v = self.v(feat).reshape(B, self.num_heads, self.head_dim, H*W)
+
+        att = torch.softmax((q.transpose(2,3) @ k) / (self.head_dim**0.5), dim=-1)
+        out = (att @ v.transpose(2,3)).transpose(2,3).reshape(B, C, H, W)
+        out = self.proj(out)
+
+        return feat + out
+
+
+class IntrinsicFusion(nn.Module):
+    """Fuse backbone features with intrinsic ray encodings using different strategies."""
+
+    AVAILABLE_MODES = (
+        "add", "concat_conv", "gated_add", "film",
+        "mlp_add", "conv_add", "residual_concat", "film_residual",
+        "star_block_conv", "att_channel", "att_spatial", "att_cross"
+    )
+
+    def __init__(self, feature_dim, mode="add"):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.mode_modules = nn.ModuleDict()
+        self.mode = None
+        self.set_mode(mode)
+
+    def set_mode(self, mode):
+        if mode not in self.AVAILABLE_MODES:
+            raise ValueError(f"Unsupported fusion mode '{mode}'. Supported: {self.AVAILABLE_MODES}")
+
+        self.mode = mode
+
+        # Original
+        if mode == "concat_conv":
+            self.mode_modules["concat_conv"] = nn.Sequential(
+                nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1, bias=False),
+                nn.BatchNorm2d(self.feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            )
+        elif mode == "gated_add":
+            self.mode_modules["gated_add"] = nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1)
+        elif mode == "film":
+            self.mode_modules["film"] = nn.ModuleDict({
+                "scale": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+                "shift": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            })
+
+        # New modules
+        elif mode == "mlp_add":
+            self.mode_modules["mlp_add"] = nn.Sequential(
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1)
+            )
+
+        elif mode == "conv_add":
+            self.mode_modules["conv_add"] = nn.Conv2d(self.feature_dim, self.feature_dim, 3, padding=1)
+
+        elif mode == "residual_concat":
+            self.mode_modules["residual_concat"] = nn.Sequential(
+                nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            )
+
+        elif mode == "film_residual":
+            self.mode_modules["film"] = nn.ModuleDict({
+                "scale": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+                "shift": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            })
+
+        elif mode == "star_block_conv":
+            self.mode_modules["star_block_conv"] = StarBlockConv(self.feature_dim)
+
+        elif mode == "att_channel":
+            self.mode_modules["att_channel"] = ChannelAttentionFuse(self.feature_dim)
+
+        elif mode == "att_spatial":
+            self.mode_modules["att_spatial"] = SpatialAttentionFuse(self.feature_dim)
+
+        elif mode == "att_cross":
+            self.mode_modules["att_cross"] = CrossAttentionFuse(self.feature_dim)
+
+    def forward(self, features, encoding):
+        if self.mode == "add":
+            return features + encoding
+
+        if self.mode == "concat_conv":
+            return self.mode_modules["concat_conv"](torch.cat([features, encoding], dim=1))
+
+        if self.mode == "gated_add":
+            gate = torch.sigmoid(self.mode_modules["gated_add"](torch.cat([features, encoding], dim=1)))
+            return features + gate * encoding
+
+        if self.mode == "film":
+            film = self.mode_modules["film"]
+            scale = torch.sigmoid(film["scale"](encoding))
+            shift = film["shift"](encoding)
+            return features * scale + shift
+
+        if self.mode == "mlp_add":
+            return features + self.mode_modules["mlp_add"](encoding)
+
+        if self.mode == "conv_add":
+            return features + self.mode_modules["conv_add"](encoding)
+
+        if self.mode == "residual_concat":
+            fused = self.mode_modules["residual_concat"](torch.cat([features, encoding], dim=1))
+            return features + fused
+
+        if self.mode == "film_residual":
+            film = self.mode_modules["film"]
+            scale = torch.sigmoid(film["scale"](encoding))
+            shift = film["shift"](encoding)
+            return features + features * scale + shift
+
+        if self.mode == "star_block_conv":
+            return self.mode_modules["star_block_conv"](features + encoding)
+
+        if self.mode == "att_channel":
+            return self.mode_modules["att_channel"](features, encoding)
+
+        if self.mode == "att_spatial":
+            return self.mode_modules["att_spatial"](features, encoding)
+
+        if self.mode == "att_cross":
+            return self.mode_modules["att_cross"](features, encoding)
+
+        raise RuntimeError(f"Unhandled fusion mode '{self.mode}'")
 
 
 class Encoder(nn.Module):
@@ -389,7 +535,7 @@ class Regressor(nn.Module):
         return regressor
 
     @classmethod
-    def _detect_intrinsics_fusion_mode(state_dict):
+    def _detect_intrinsics_fusion_mode(cls, state_dict):
         if any(k.startswith("intrinsics_fusion.mode_modules.film") for k in state_dict):
             return "film"
         if any(k.startswith("intrinsics_fusion.mode_modules.gated_add") for k in state_dict):

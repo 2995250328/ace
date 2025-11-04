@@ -2,8 +2,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
-  echo "Usage: $0 <scene_path> <models_dir> [test_ace.py args...]" >&2
-  echo "Example: $0 datasets/Cambridge_GreatCourt outputs --session eval" >&2
+  echo "Usage: $0 <scene_path> <models_dir> [test args...]"
   exit 1
 fi
 
@@ -12,47 +11,52 @@ shift
 MODELS_DIR=$1
 shift
 
-SESSION_PREFIX=${SESSION_PREFIX:-fusion_}
+EVAL_ROOT="$(readlink -f ${MODELS_DIR})/eval"
+mkdir -p "${EVAL_ROOT}"
 
-if [ ! -d "${MODELS_DIR}" ]; then
-  echo "[test_intrinsics_fusion_sweep] Models directory '${MODELS_DIR}' does not exist." >&2
-  exit 2
-fi
+MODES=(
+  "mlp_add"
+  "conv_add"
+  "residual_concat"
+  "film_residual"
+  "star_block_conv"
+  "att_channel"
+  "att_spatial"
+  "att_cross"
+)
 
-shopt -s nullglob
-MODEL_FILES=("${MODELS_DIR}"/*.pt)
-shopt -u nullglob
-
-if [ ${#MODEL_FILES[@]} -eq 0 ]; then
-  echo "[test_intrinsics_fusion_sweep] No .pt models found in '${MODELS_DIR}'." >&2
-  exit 3
-fi
-
-for MODEL_PATH in "${MODEL_FILES[@]}"; do
-  MODEL_NAME=$(basename "${MODEL_PATH}")
-  if [[ ${MODEL_NAME} =~ _([a-zA-Z0-9_]+)\.pt$ ]]; then
-    MODE_SUFFIX=${BASH_REMATCH[1]}
-  else
-    MODE_SUFFIX="auto"
-  fi
-  SESSION_VALUE="${SESSION_PREFIX}${MODE_SUFFIX}"
-  echo "[test_intrinsics_fusion_sweep] Evaluating ${MODEL_NAME} (session=${SESSION_VALUE})." >&2
-
-  EXTRA_ARGS=()
-  SESSION_SPECIFIED=false
-  for ARG in "$@"; do
-    if [[ ${ARG} == --session ]] || [[ ${ARG} == --session=* ]]; then
-      SESSION_SPECIFIED=true
-      break
-    fi
-  done
-  if ! ${SESSION_SPECIFIED}; then
-    EXTRA_ARGS=(--session "${SESSION_VALUE}")
-  fi
-
-  python test_ace.py "${SCENE_PATH}" "${MODEL_PATH}" "${EXTRA_ARGS[@]}" "$@"
-  echo "[test_intrinsics_fusion_sweep] Finished ${MODEL_NAME}." >&2
-  echo >&2
+# Remove user session flags
+CLEAN_ARGS=()
+for ARG in "$@"; do
+  [[ "$ARG" == --session* ]] && echo "[WARN] ignored $ARG" && continue
+  CLEAN_ARGS+=("$ARG")
 done
 
-echo "[test_intrinsics_fusion_sweep] Evaluation complete for models in ${MODELS_DIR}." >&2
+for MODE in "${MODES[@]}"; do
+  MODEL=$(ls "${MODELS_DIR}"/*${MODE}.pt 2>/dev/null || true)
+  [[ -z "$MODEL" ]] && echo "[SKIP] No model for $MODE" && continue
+
+  MODEL=$(readlink -f "$MODEL")
+  OUT_DIR="${EVAL_ROOT}/${MODE}"
+  mkdir -p "${OUT_DIR}"
+
+  LOG_FILE="${OUT_DIR}/eval.log"
+  SESSION="fusion_${MODE}"
+
+  echo "[TEST] $MODE"
+  echo " model   = $MODEL"
+  echo " session = $SESSION"
+  echo " log     = $LOG_FILE"
+  echo
+
+  # ✅ Use absolute path for script & log, no cd issues
+  python "$(readlink -f test_ace.py)" \
+    "${SCENE_PATH}" \
+    "${MODEL}" \
+    --intrinsics_fusion "${MODE}" \
+    --session "${SESSION}" \
+    "${CLEAN_ARGS[@]}" \
+    > "${LOG_FILE}" 2>&1
+done
+
+echo "✅ All fusion tests completed. Logs at: ${EVAL_ROOT}/<mode>/eval.log"

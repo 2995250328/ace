@@ -602,6 +602,17 @@ class Regressor(nn.Module):
         encoder_state_dict: encoder state dictionary
         head_state_dict: scene-specific head state dictionary
         """
+        # Extract heads and intrinsics fusion state dicts if they are stored separately.
+        saved_fusion_mode = None
+        intrinsics_state_dict = {}
+
+        if isinstance(head_state_dict, dict) and "heads" in head_state_dict:
+            saved_fusion_mode = head_state_dict.get("intrinsics_fusion_mode")
+            intrinsics_state_dict = head_state_dict.get("intrinsics_fusion", {})
+            head_state_dict = head_state_dict.get("heads", {})
+        elif isinstance(head_state_dict, dict):
+            saved_fusion_mode = head_state_dict.get("intrinsics_fusion_mode")
+
         # We simply merge the dictionaries and call the other constructor.
         merged_state_dict = {}
 
@@ -611,10 +622,15 @@ class Regressor(nn.Module):
         for k, v in head_state_dict.items():
             merged_state_dict[f"heads.{k}"] = v
 
+        for k, v in intrinsics_state_dict.items():
+            merged_state_dict[f"intrinsics_fusion.{k}"] = v
+
         if intrinsics_fusion_mode == "auto":
             intrinsics_fusion_mode = None
 
-        return cls.create_from_state_dict(merged_state_dict, intrinsics_fusion_mode)
+        fusion_mode = intrinsics_fusion_mode or saved_fusion_mode
+
+        return cls.create_from_state_dict(merged_state_dict, fusion_mode)
 
     def load_encoder(self, encoder_dict_file):
         """

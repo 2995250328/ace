@@ -41,6 +41,9 @@ EPS = 1e-12
 def percent_improve(val, baseline):
     return 100.0 * (val - baseline) / (baseline + EPS)
 
+def percent_reduction(val, baseline):
+    return 100.0 * (baseline - val) / (baseline + EPS)
+
 def robust_cap(values, pct=95):
     cap = np.percentile(values, pct)
     return np.minimum(values, cap), cap
@@ -195,6 +198,71 @@ def composite(sub, scene):
     sub.to_csv(f"{TABLE_DIR}/{scene}_composite_rank.csv", index=False)
     print(f"[{scene}] ✅ composite saved")
 
+def latex_escape(text):
+    return (
+        text.replace("\\", r"\textbackslash{}")
+        .replace("_", r"\_")
+        .replace("%", r"\%")
+        .replace("&", r"\&")
+        .replace("$", r"\$")
+        .replace("#", r"\#")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+    )
+
+def latex_table(sub, scene):
+    sub = sub.copy()
+    sub = sub.sort_values(METRICS, ascending=[True] * len(METRICS))
+
+    has_baseline = "baseline" in sub["mode"].values
+    if has_baseline:
+        baseline_row = sub[sub["mode"] == "baseline"].iloc[0]
+        baseline_rot = float(baseline_row[METRICS[0]])
+        baseline_trans = float(baseline_row[METRICS[1]])
+    else:
+        baseline_rot = baseline_trans = None
+
+    body = []
+    for _, row in sub.iterrows():
+        mode_raw = str(row["mode"])
+        mode = latex_escape(mode_raw)
+        rot = float(row[METRICS[0]])
+        trans = float(row[METRICS[1]])
+        fields = [mode, f"{rot:.3f}", f"{trans:.3f}"]
+        if has_baseline:
+            if mode_raw == "baseline":
+                rot_delta = trans_delta = 0.0
+            else:
+                rot_delta = percent_reduction(rot, baseline_rot)
+                trans_delta = percent_reduction(trans, baseline_trans)
+            fields.extend([f"{rot_delta:.1f}", f"{trans_delta:.1f}"])
+        body.append(" & ".join(fields) + " \\")
+
+    header_cols = ["Mode", "$\\mathrm{Rot}\\downarrow$", "$\\mathrm{Trans}\\downarrow$"]
+    if has_baseline:
+        header_cols.extend(["$\\Delta$ Rot (\%) $\\uparrow$", "$\\Delta$ Trans (\%) $\\uparrow$"])
+
+    col_spec = "l" + "r" * (len(header_cols) - 1)
+    lines = [
+        "\\begin{table}[t]",
+        "\\centering",
+        f"\\caption{{{scene.title()} intrinsics fusion results. Lower is better.}}",
+        f"\\label{{tab:{scene}_fusion}}",
+        f"\\begin{{tabular}}{{{col_spec}}}",
+        "\\toprule",
+        " & ".join(header_cols) + " \\",
+        "\\midrule",
+        "\n".join(body),
+        "\\bottomrule",
+        "\\end{tabular}",
+        "\\end{table}",
+    ]
+
+    latex_path = f"{TABLE_DIR}/{scene}_fusion_table.tex"
+    with open(latex_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[{scene}] ✅ LaTeX table saved → {latex_path}")
+
 scene = "chess"
 sub = df[df["scene"]=="chess"].copy()
 
@@ -204,6 +272,7 @@ for m in METRICS:
 plot_rank(sub, scene)
 plot_radar(sub, scene)
 composite(sub, scene)
+latex_table(sub, scene)
 
 print("\n✅ ALL DONE")
 print(f"📁 results saved in {OUT_ROOT}")

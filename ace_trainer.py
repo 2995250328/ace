@@ -1,6 +1,7 @@
 # Copyright © Niantic, Inc. 2022.
 
 import logging
+import math
 import random
 import time
 
@@ -107,11 +108,39 @@ class TrainerACE:
         self.regressor = self.regressor.to(self.device)
         self.regressor.train()
 
-        # Setup optimization parameters.
-        self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
+        # Freeze the pretrained encoder (backbone) so that only the fusion module and head are
+        # optimised during training. This keeps feature extraction fixed while allowing the
+        # intrinsics fusion layers to adapt.
+        for param in self.regressor.encoder.parameters():
+            param.requires_grad_(False)
+        self.regressor.encoder.eval()
+
+        # Buffer chunk configuration controls how often we refresh the feature buffer so that
+        # newly optimised fusion weights are reflected in future training batches.
+        preferred_chunk_size = getattr(self.options, "buffer_chunk_size", None)
+        self.auto_buffer_chunk_size = None
+        if preferred_chunk_size is None or preferred_chunk_size <= 0:
+            self.auto_buffer_chunk_size = self._recommend_buffer_chunk_size(
+                int(self.options.training_buffer_size),
+                int(self.options.batch_size),
+            )
+            preferred_chunk_size = self.auto_buffer_chunk_size
+
+        self.buffer_chunk_sizes = self._build_buffer_chunk_schedule(preferred_chunk_size)
+        self.total_buffer_chunks = len(self.buffer_chunk_sizes)
+
+        # Setup optimization parameters (only trainable parameters are included).
+        trainable_params = [p for p in self.regressor.parameters() if p.requires_grad]
+        if not self.buffer_chunk_sizes:
+            raise ValueError("Training buffer schedule is empty; check buffer_chunk_size and batch_size options.")
+
+        self.optimizer = optim.AdamW(trainable_params, lr=self.options.learning_rate_min)
 
         # Setup learning rate scheduler.
-        steps_per_epoch = self.options.training_buffer_size // self.options.batch_size
+        steps_per_epoch = sum(chunk_size // self.options.batch_size for chunk_size in self.buffer_chunk_sizes)
+        if steps_per_epoch == 0:
+            raise ValueError("Batch size is larger than every configured training buffer chunk.")
+        self.steps_per_epoch = steps_per_epoch
         self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer,
                                                        max_lr=self.options.learning_rate_max,
                                                        epochs=self.options.epochs,
@@ -126,8 +155,28 @@ class TrainerACE:
         self.pixel_grid_2HW = pixel_grid_2HW.to(self.device)
 
         # Compute total number of iterations.
-        self.iterations = self.options.epochs * self.options.training_buffer_size // self.options.batch_size
+        self.iterations = self.options.epochs * steps_per_epoch
         self.iterations_output = 100 # print loss every n iterations, and (optionally) write a visualisation frame
+
+        if self.auto_buffer_chunk_size is not None:
+            _logger.info(
+                "Auto-selected buffer chunk size: %d (total buffer %d, batch %d, %d chunks per epoch)",
+                self.auto_buffer_chunk_size,
+                int(self.options.training_buffer_size),
+                int(self.options.batch_size),
+                self.total_buffer_chunks,
+            )
+
+        if self.total_buffer_chunks > 1:
+            preview_count = min(3, self.total_buffer_chunks)
+            chunk_preview = ", ".join(str(size) for size in self.buffer_chunk_sizes[:preview_count])
+            if self.total_buffer_chunks > preview_count:
+                chunk_preview += ", ..."
+            _logger.info(
+                "Training buffer will refresh %d chunks per epoch (first chunks: %s)",
+                self.total_buffer_chunks,
+                chunk_preview,
+            )
 
         # Setup reprojection loss function.
         self.repro_loss = ReproLoss(
@@ -155,6 +204,49 @@ class TrainerACE:
         else:
             self.ace_visualizer = None
 
+    def _build_buffer_chunk_schedule(self, preferred_chunk_size):
+        """Return a list of buffer sizes to process sequentially each epoch."""
+        total = int(self.options.training_buffer_size)
+        batch = int(self.options.batch_size)
+
+        if preferred_chunk_size is None or preferred_chunk_size <= 0:
+            preferred_chunk_size = self._recommend_buffer_chunk_size(total, batch)
+
+        preferred_chunk_size = int(preferred_chunk_size)
+        schedule = []
+
+        if preferred_chunk_size >= total:
+            schedule.append(total)
+            return schedule
+
+        chunk_multiple = max(preferred_chunk_size // batch, 1) * batch
+
+        while total > chunk_multiple:
+            schedule.append(chunk_multiple)
+            total -= chunk_multiple
+
+        if total > 0:
+            if total < batch and schedule:
+                schedule[-1] += total
+            else:
+                schedule.append(total)
+
+        return schedule
+
+    def _recommend_buffer_chunk_size(self, total_size, batch_size):
+        """Heuristic chunk sizing that keeps ~2M samples per refresh."""
+        target_features_per_chunk = 2_000_000
+
+        if total_size <= target_features_per_chunk:
+            return total_size
+
+        approx_chunks = max(1, math.ceil(total_size / target_features_per_chunk))
+        chunk_size = math.ceil(total_size / approx_chunks)
+
+        chunk_size = max(batch_size, math.ceil(chunk_size / batch_size) * batch_size)
+
+        return min(chunk_size, total_size)
+
     def train(self):
         """
         Main training method.
@@ -177,18 +269,44 @@ class TrainerACE:
 
         self.training_start = time.time()
 
-        # Create training buffer.
-        buffer_start_time = time.time()
-        self.create_training_buffer()
-        buffer_end_time = time.time()
-        creating_buffer_time += buffer_end_time - buffer_start_time
-        _logger.info(f"Filled training buffer in {buffer_end_time - buffer_start_time:.1f}s.")
-
-        # Train the regression head.
+        # Train the regression head and fusion modules, refreshing the buffer after each chunk so
+        # that updated fusion parameters influence subsequent feature batches.
         for self.epoch in range(self.options.epochs):
             epoch_start_time = time.time()
-            self.run_epoch()
-            training_time += time.time() - epoch_start_time
+            epoch_buffer_time = 0.
+            epoch_training_time = 0.
+            for chunk_idx, chunk_size in enumerate(self.buffer_chunk_sizes, start=1):
+                buffer_start_time = time.time()
+                self.create_training_buffer(chunk_size, chunk_index=chunk_idx)
+                buffer_end_time = time.time()
+                buffer_duration = buffer_end_time - buffer_start_time
+                creating_buffer_time += buffer_duration
+                epoch_buffer_time += buffer_duration
+                _logger.info(
+                    "Filled training buffer chunk %d/%d (size=%d) in %.1fs.",
+                    chunk_idx,
+                    self.total_buffer_chunks,
+                    chunk_size,
+                    buffer_duration,
+                )
+
+                chunk_training_start = time.time()
+                self.run_epoch(chunk_size)
+                chunk_training_duration = time.time() - chunk_training_start
+                training_time += chunk_training_duration
+                epoch_training_time += chunk_training_duration
+
+                # Release the chunk to free GPU memory before the next refill.
+                self.training_buffer = None
+
+            _logger.info(
+                "Completed epoch %03d/%03d in %.1fs (buffers %.1fs, training %.1fs)",
+                self.epoch + 1,
+                self.options.epochs,
+                time.time() - epoch_start_time,
+                epoch_buffer_time,
+                epoch_training_time,
+            )
 
         # Save trained model.
         self.save_model()
@@ -216,7 +334,7 @@ class TrainerACE:
 
             self.ace_visualizer.finalize_mapping(self.regressor, vis_dataset_loader)
 
-    def create_training_buffer(self):
+    def create_training_buffer(self, buffer_size, chunk_index=None):
         # Disable benchmarking, since we have variable tensor sizes.
         torch.backends.cudnn.benchmark = False
 
@@ -246,26 +364,33 @@ class TrainerACE:
                                          timeout=60 if self.num_data_loader_workers > 0 else 0,
                                          )
 
-        _logger.info("Starting creation of the training buffer.")
+        if chunk_index is None:
+            _logger.info("Starting creation of the training buffer.")
+        else:
+            _logger.info(
+                "Starting creation of the training buffer chunk %d/%d.",
+                chunk_index,
+                self.total_buffer_chunks,
+            )
         progress_bar = None
         if tqdm is not None:
             progress_bar = tqdm(
-                total=self.options.training_buffer_size,
-                desc="Filling training buffer",
+                total=buffer_size,
+                desc="Filling training buffer" if chunk_index is None else f"Buffer chunk {chunk_index}",
                 unit="sample",
                 leave=False,
             )
 
         # Create a training buffer that lives on the GPU.
         self.training_buffer = {
-            'features': torch.empty((self.options.training_buffer_size, self.regressor.feature_dim),
+            'features': torch.empty((buffer_size, self.regressor.feature_dim),
                                     dtype=(torch.float32, torch.float16)[self.options.use_half], device=self.device),
-            'target_px': torch.empty((self.options.training_buffer_size, 2), dtype=torch.float32, device=self.device),
-            'gt_poses_inv': torch.empty((self.options.training_buffer_size, 3, 4), dtype=torch.float32,
+            'target_px': torch.empty((buffer_size, 2), dtype=torch.float32, device=self.device),
+            'gt_poses_inv': torch.empty((buffer_size, 3, 4), dtype=torch.float32,
                                         device=self.device),
-            'intrinsics': torch.empty((self.options.training_buffer_size, 3, 3), dtype=torch.float32,
+            'intrinsics': torch.empty((buffer_size, 3, 3), dtype=torch.float32,
                                       device=self.device),
-            'intrinsics_inv': torch.empty((self.options.training_buffer_size, 3, 3), dtype=torch.float32,
+            'intrinsics_inv': torch.empty((buffer_size, 3, 3), dtype=torch.float32,
                                           device=self.device)
         }
 
@@ -279,7 +404,7 @@ class TrainerACE:
             dataset_passes = 0
 
             try:
-                while buffer_idx < self.options.training_buffer_size:
+                while buffer_idx < buffer_size:
                     dataset_passes += 1
                     for image_B1HW, image_mask_B1HW, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
 
@@ -336,7 +461,7 @@ class TrainerACE:
 
                         # Over-sample according to image mask.
                         features_to_select = self.options.samples_per_image * B
-                        features_to_select = min(features_to_select, self.options.training_buffer_size - buffer_idx)
+                        features_to_select = min(features_to_select, buffer_size - buffer_idx)
 
                         # Sample indices uniformly, with replacement.
                         sample_idxs = torch.multinomial(image_mask_N1.view(-1),
@@ -356,7 +481,7 @@ class TrainerACE:
                         buffer_idx = buffer_offset
                         if progress_bar is not None:
                             progress_bar.update(features_to_select)
-                        if buffer_idx >= self.options.training_buffer_size:
+                        if buffer_idx >= buffer_size:
                             break
             finally:
                 if progress_bar is not None:
@@ -365,10 +490,16 @@ class TrainerACE:
         buffer_memory = sum([v.element_size() * v.nelement() for k, v in self.training_buffer.items()])
         buffer_memory /= 1024 * 1024 * 1024
 
-        _logger.info(f"Created buffer of {buffer_memory:.2f}GB with {dataset_passes} passes over the training data.")
+        _logger.info(
+            "Created buffer chunk (%d samples) of %.2fGB with %d passes over the training data.",
+            buffer_size,
+            buffer_memory,
+            dataset_passes,
+        )
         self.regressor.train()
+        self.regressor.encoder.eval()
 
-    def run_epoch(self):
+    def run_epoch(self, buffer_size):
         """
         Run one epoch of training, shuffling the feature buffer and iterating over it.
         """
@@ -376,14 +507,14 @@ class TrainerACE:
         torch.backends.cudnn.benchmark = True
 
         # Shuffle indices.
-        random_indices = torch.randperm(self.options.training_buffer_size, generator=self.training_generator)
+        random_indices = torch.randperm(buffer_size, generator=self.training_generator)
 
         # Iterate with mini batches.
-        for batch_start in range(0, self.options.training_buffer_size, self.options.batch_size):
+        for batch_start in range(0, buffer_size, self.options.batch_size):
             batch_end = batch_start + self.options.batch_size
 
             # Drop last batch if not full.
-            if batch_end > self.options.training_buffer_size:
+            if batch_end > buffer_size:
                 continue
 
             # Sample indices.
@@ -498,9 +629,29 @@ class TrainerACE:
         # torch.save(self.regressor.state_dict(), self.options.output_map_file)
 
         # This saves just the head weights as half-precision floating point numbers for a total of ~4MB, as mentioned
-        # in the paper. The scene-agnostic encoder weights can then be loaded from the pretrained encoder file.
-        head_state_dict = self.regressor.heads.state_dict()
-        for k, v in head_state_dict.items():
-            head_state_dict[k] = head_state_dict[k].half()
-        torch.save(head_state_dict, self.options.output_map_file)
-        _logger.info(f"Saved trained head weights to: {self.options.output_map_file}")
+        # in the paper. The scene-agnostic encoder weights can then be loaded from the pretrained encoder file. When
+        # using intrinsic feature fusion, we also need to persist the learned fusion parameters.
+
+        def _to_half_state(state_dict):
+            half_state = state_dict.__class__()
+            for key, value in state_dict.items():
+                if torch.is_tensor(value) and value.is_floating_point():
+                    half_state[key] = value.half()
+                else:
+                    half_state[key] = value
+            return half_state
+
+        head_state_dict = _to_half_state(self.regressor.heads.state_dict())
+        intrinsics_state_dict = _to_half_state(self.regressor.intrinsics_fusion.state_dict())
+
+        save_state = {
+            "heads": head_state_dict,
+            "intrinsics_fusion": intrinsics_state_dict,
+            "intrinsics_fusion_mode": self.regressor.intrinsics_fusion_mode,
+        }
+
+        torch.save(save_state, self.options.output_map_file)
+        _logger.info(
+            "Saved trained head and intrinsics fusion weights to: %s",
+            self.options.output_map_file,
+        )

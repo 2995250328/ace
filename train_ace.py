@@ -6,6 +6,7 @@ import logging
 from distutils.util import strtobool
 from pathlib import Path
 
+from ace_network import IntrinsicFusion
 from ace_trainer import TrainerACE
 
 
@@ -48,6 +49,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--batch_size', type=int, default=5120,
                         help='number of patches for each parameter update (has to be a multiple of 512)')
+    parser.add_argument('--buffer_chunk_size', type=int, default=None,
+                        help='patches per buffer refill; defaults to ~2M so fusion updates feed the next chunk')
 
     parser.add_argument('--epochs', type=int, default=16,
                         help='number of runs through the training buffer')
@@ -120,6 +123,10 @@ if __name__ == '__main__':
 
     parser.add_argument('--render_camera_z_offset', type=int, default=4,
                         help='zoom out of the scene by moving render camera backwards, in meters')
+
+    parser.add_argument('--intrinsics_fusion', type=str, default='add',
+                        choices=IntrinsicFusion.AVAILABLE_MODES,
+                        help='strategy used to fuse intrinsic encodings with backbone features during training')
 
     options = parser.parse_args()
 

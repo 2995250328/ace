@@ -15,7 +15,7 @@ from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 
 import dsacstar
-from ace_network import Regressor
+from ace_network import IntrinsicFusion, Regressor
 from dataset import CamLocDataset
 
 import ace_vis_util as vutil
@@ -49,6 +49,9 @@ if __name__ == '__main__':
                              'useful to separate different runs of a script')
 
     parser.add_argument('--image_resolution', type=int, default=480, help='base image resolution')
+    parser.add_argument('--intrinsics_fusion', type=str, default='auto',
+                        choices=list(IntrinsicFusion.AVAILABLE_MODES) + ['auto'],
+                        help='strategy for combining intrinsic encodings with features; auto reads it from the checkpoint if available')
 
     # ACE is RGB-only, no need for this param.
     # parser.add_argument('--mode', '-m', type=int, default=1, choices=[1, 2], help='test mode: 1 = RGB, 2 = RGB-D')
@@ -121,7 +124,12 @@ if __name__ == '__main__':
     _logger.info(f"Loaded head weights from: {head_network_path}")
 
     # Create regressor.
-    network = Regressor.create_from_split_state_dict(encoder_state_dict, head_state_dict)
+    fusion_mode = None if opt.intrinsics_fusion == 'auto' else opt.intrinsics_fusion
+    network = Regressor.create_from_split_state_dict(
+        encoder_state_dict,
+        head_state_dict,
+        intrinsics_fusion_mode=fusion_mode,
+    )
 
     # Setup for evaluation.
     network = network.to(device)
@@ -193,10 +201,11 @@ if __name__ == '__main__':
             batch_size = image_B1HW.shape[0]
 
             image_B1HW = image_B1HW.to(device, non_blocking=True)
+            intrinsics_B33_gpu = intrinsics_B33.to(device, non_blocking=True)
 
             # Predict scene coordinates.
             with autocast(enabled=True):
-                scene_coordinates_B3HW = network(image_B1HW)
+                scene_coordinates_B3HW = network(image_B1HW, intrinsics_B33_gpu)
 
             # We need them on the CPU to run RANSAC.
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()

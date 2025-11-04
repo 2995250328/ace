@@ -8,7 +8,303 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ace_util import get_pixel_grid
+
 _logger = logging.getLogger(__name__)
+
+
+class IntrinsicRayEncoding(nn.Module):
+    """Sinusoidal encoding of camera rays using image intrinsics."""
+
+    def __init__(self, feature_dim, subsampling_factor=8, scale=400.0):
+        super().__init__()
+
+        if feature_dim % 4 != 0:
+            raise ValueError("feature_dim must be divisible by 4 for sine/cosine encoding")
+
+        self.feature_dim = feature_dim
+        self.subsampling_factor = subsampling_factor
+        self.scale = scale
+
+        frequency = torch.exp(
+            torch.arange(0, feature_dim // 2, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / (feature_dim // 2))
+        )
+        self.register_buffer('frequency', frequency.view(1, -1), persistent=False)
+
+        pixel_grid = get_pixel_grid(subsampling_factor)
+        self.register_buffer('pixel_grid_2HW', pixel_grid, persistent=False)
+
+    def _encode_directions(self, x_scaled, y_scaled):
+        freq = self.frequency.to(x_scaled.dtype)
+
+        sin_x = torch.sin(x_scaled.unsqueeze(1) * freq)
+        cos_x = torch.cos(x_scaled.unsqueeze(1) * freq)
+        sin_y = torch.sin(y_scaled.unsqueeze(1) * freq)
+        cos_y = torch.cos(y_scaled.unsqueeze(1) * freq)
+
+        return torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
+
+    def encode_points(self, pixel_coords_b2, intrinsics_b33):
+        if pixel_coords_b2.shape[0] != intrinsics_b33.shape[0]:
+            raise ValueError("Pixel coordinate and intrinsics batches must have the same length")
+
+        x = pixel_coords_b2[:, 0]
+        y = pixel_coords_b2[:, 1]
+
+        fx = intrinsics_b33[:, 0, 0]
+        fy = intrinsics_b33[:, 1, 1]
+        cx = intrinsics_b33[:, 0, 2]
+        cy = intrinsics_b33[:, 1, 2]
+
+        x_scaled = (x - cx) / fx * self.scale
+        y_scaled = (y - cy) / fy * self.scale
+
+        return self._encode_directions(x_scaled, y_scaled)
+
+    def encode_grid(self, intrinsics_b33, spatial_size, dtype, device):
+        B = intrinsics_b33.shape[0]
+        H, W = spatial_size
+
+        grid = self.pixel_grid_2HW[:, :H, :W].to(device=device, dtype=dtype)
+
+        x = grid[0].unsqueeze(0).expand(B, -1, -1)
+        y = grid[1].unsqueeze(0).expand(B, -1, -1)
+
+        fx = intrinsics_b33[:, 0, 0].view(B, 1, 1)
+        fy = intrinsics_b33[:, 1, 1].view(B, 1, 1)
+        cx = intrinsics_b33[:, 0, 2].view(B, 1, 1)
+        cy = intrinsics_b33[:, 1, 2].view(B, 1, 1)
+
+        x_scaled = (x - cx) / fx * self.scale
+        y_scaled = (y - cy) / fy * self.scale
+
+        freq = self.frequency.view(1, -1, 1, 1).to(dtype=dtype, device=device)
+
+        sin_x = torch.sin(x_scaled.unsqueeze(1) * freq)
+        cos_x = torch.cos(x_scaled.unsqueeze(1) * freq)
+        sin_y = torch.sin(y_scaled.unsqueeze(1) * freq)
+        cos_y = torch.cos(y_scaled.unsqueeze(1) * freq)
+
+        return torch.cat([sin_x, cos_x, sin_y, cos_y], dim=1)
+
+from timm.models.layers import DropPath
+
+class StarBlockConv(nn.Module):
+    """Conv-based STAR block for feature maps [B,C,H,W]"""
+    def __init__(self, dim, mlp_ratio=3, drop_path=0.):
+        super().__init__()
+        hidden_dim = dim * mlp_ratio
+
+        self.norm = nn.BatchNorm2d(dim)
+
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, dim, 1),
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, 1),
+            nn.Sigmoid(),
+            nn.Conv2d(hidden_dim, dim, 1),
+        )
+
+        self.mix = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 1),
+        )
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm(x)
+
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+
+        x = x1 * x2
+        x = self.mix(x)
+
+        return shortcut + self.drop_path(x)
+
+
+class ChannelAttentionFuse(nn.Module):
+    def __init__(self, dim, reduction=4):
+        super().__init__()
+        hidden = dim // reduction
+        self.mlp = nn.Sequential(
+            nn.Conv2d(dim, hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, feat, enc):
+        w = self.mlp(enc)
+        return feat * (1 + w)
+
+
+class SpatialAttentionFuse(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, 1, 3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, feat, enc):
+        avg = torch.mean(enc, dim=1, keepdim=True)
+        maxv, _ = torch.max(enc, dim=1, keepdim=True)
+        att = self.conv(torch.cat([avg, maxv], dim=1))
+        return feat + feat * att
+
+
+class CrossAttentionFuse(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q = nn.Conv2d(dim, dim, 1)
+        self.k = nn.Conv2d(dim, dim, 1)
+        self.v = nn.Conv2d(dim, dim, 1)
+        self.proj = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, feat, enc):
+        B, C, H, W = feat.shape
+        q = self.q(enc).reshape(B, self.num_heads, self.head_dim, H*W)
+        k = self.k(feat).reshape(B, self.num_heads, self.head_dim, H*W)
+        v = self.v(feat).reshape(B, self.num_heads, self.head_dim, H*W)
+
+        att = torch.softmax((q.transpose(2,3) @ k) / (self.head_dim**0.5), dim=-1)
+        out = (att @ v.transpose(2,3)).transpose(2,3).reshape(B, C, H, W)
+        out = self.proj(out)
+
+        return feat + out
+
+
+class IntrinsicFusion(nn.Module):
+    """Fuse backbone features with intrinsic ray encodings using different strategies."""
+
+    AVAILABLE_MODES = (
+        "add", "concat_conv", "gated_add", "film",
+        "mlp_add", "conv_add", "residual_concat", "film_residual",
+        "star_block_conv", "att_channel", "att_spatial", "att_cross"
+    )
+
+    def __init__(self, feature_dim, mode="add"):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.mode_modules = nn.ModuleDict()
+        self.mode = None
+        self.set_mode(mode)
+
+    def set_mode(self, mode):
+        if mode not in self.AVAILABLE_MODES:
+            raise ValueError(f"Unsupported fusion mode '{mode}'. Supported: {self.AVAILABLE_MODES}")
+
+        self.mode = mode
+
+        # Original
+        if mode == "concat_conv":
+            self.mode_modules["concat_conv"] = nn.Sequential(
+                nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1, bias=False),
+                nn.BatchNorm2d(self.feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            )
+        elif mode == "gated_add":
+            self.mode_modules["gated_add"] = nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1)
+        elif mode == "film":
+            self.mode_modules["film"] = nn.ModuleDict({
+                "scale": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+                "shift": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            })
+
+        # New modules
+        elif mode == "mlp_add":
+            self.mode_modules["mlp_add"] = nn.Sequential(
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1)
+            )
+
+        elif mode == "conv_add":
+            self.mode_modules["conv_add"] = nn.Conv2d(self.feature_dim, self.feature_dim, 3, padding=1)
+
+        elif mode == "residual_concat":
+            self.mode_modules["residual_concat"] = nn.Sequential(
+                nn.Conv2d(self.feature_dim * 2, self.feature_dim, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            )
+
+        elif mode == "film_residual":
+            self.mode_modules["film"] = nn.ModuleDict({
+                "scale": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+                "shift": nn.Conv2d(self.feature_dim, self.feature_dim, 1),
+            })
+
+        elif mode == "star_block_conv":
+            self.mode_modules["star_block_conv"] = StarBlockConv(self.feature_dim)
+
+        elif mode == "att_channel":
+            self.mode_modules["att_channel"] = ChannelAttentionFuse(self.feature_dim)
+
+        elif mode == "att_spatial":
+            self.mode_modules["att_spatial"] = SpatialAttentionFuse(self.feature_dim)
+
+        elif mode == "att_cross":
+            self.mode_modules["att_cross"] = CrossAttentionFuse(self.feature_dim)
+
+    def forward(self, features, encoding):
+        if self.mode == "add":
+            return features + encoding
+
+        if self.mode == "concat_conv":
+            return self.mode_modules["concat_conv"](torch.cat([features, encoding], dim=1))
+
+        if self.mode == "gated_add":
+            gate = torch.sigmoid(self.mode_modules["gated_add"](torch.cat([features, encoding], dim=1)))
+            return features + gate * encoding
+
+        if self.mode == "film":
+            film = self.mode_modules["film"]
+            scale = torch.sigmoid(film["scale"](encoding))
+            shift = film["shift"](encoding)
+            return features * scale + shift
+
+        if self.mode == "mlp_add":
+            return features + self.mode_modules["mlp_add"](encoding)
+
+        if self.mode == "conv_add":
+            return features + self.mode_modules["conv_add"](encoding)
+
+        if self.mode == "residual_concat":
+            fused = self.mode_modules["residual_concat"](torch.cat([features, encoding], dim=1))
+            return features + fused
+
+        if self.mode == "film_residual":
+            film = self.mode_modules["film"]
+            scale = torch.sigmoid(film["scale"](encoding))
+            shift = film["shift"](encoding)
+            return features + features * scale + shift
+
+        if self.mode == "star_block_conv":
+            return self.mode_modules["star_block_conv"](features + encoding)
+
+        if self.mode == "att_channel":
+            return self.mode_modules["att_channel"](features, encoding)
+
+        if self.mode == "att_spatial":
+            return self.mode_modules["att_spatial"](features, encoding)
+
+        if self.mode == "att_cross":
+            return self.mode_modules["att_cross"](features, encoding)
+
+        raise RuntimeError(f"Unhandled fusion mode '{self.mode}'")
 
 
 class Encoder(nn.Module):
@@ -158,7 +454,14 @@ class Regressor(nn.Module):
 
     OUTPUT_SUBSAMPLE = 8
 
-    def __init__(self, mean, num_head_blocks, use_homogeneous, num_encoder_features=512):
+    def __init__(
+        self,
+        mean,
+        num_head_blocks,
+        use_homogeneous,
+        num_encoder_features=512,
+        intrinsics_fusion_mode="add",
+    ):
         """
         Constructor.
 
@@ -172,10 +475,38 @@ class Regressor(nn.Module):
         self.feature_dim = num_encoder_features
 
         self.encoder = Encoder(out_channels=self.feature_dim)
+        self.ray_encoder = IntrinsicRayEncoding(self.feature_dim, self.OUTPUT_SUBSAMPLE)
+        self.intrinsics_fusion = IntrinsicFusion(self.feature_dim, intrinsics_fusion_mode)
         self.heads = Head(mean, num_head_blocks, use_homogeneous, in_channels=self.feature_dim)
 
+    @property
+    def intrinsics_fusion_mode(self):
+        return self.intrinsics_fusion.mode
+
+    def _fuse_intrinsics(self, features, intrinsics):
+        if intrinsics is None:
+            return features
+
+        ray_encoding = self.ray_encoder.encode_grid(
+            intrinsics,
+            spatial_size=features.shape[-2:],
+            dtype=features.dtype,
+            device=features.device,
+        )
+        return self.intrinsics_fusion(features, ray_encoding)
+
+    def set_intrinsics_fusion_mode(self, mode):
+        self.intrinsics_fusion.set_mode(mode)
+
     @classmethod
-    def create_from_encoder(cls, encoder_state_dict, mean, num_head_blocks, use_homogeneous):
+    def create_from_encoder(
+        cls,
+        encoder_state_dict,
+        mean,
+        num_head_blocks,
+        use_homogeneous,
+        intrinsics_fusion_mode="add",
+    ):
         """
         Create a regressor using a pretrained encoder, loading encoder-specific parameters from the state dict.
 
@@ -189,8 +520,13 @@ class Regressor(nn.Module):
         num_encoder_features = encoder_state_dict['res2_conv3.weight'].shape[0]
 
         # Create a regressor.
-        _logger.info(f"Creating Regressor using pretrained encoder with {num_encoder_features} feature size.")
-        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features)
+        _logger.info(
+            "Creating Regressor using pretrained encoder with %s feature size and '%s' fusion.",
+            num_encoder_features,
+            intrinsics_fusion_mode,
+        )
+
+        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features, intrinsics_fusion_mode)
 
         # Load encoder weights.
         regressor.encoder.load_state_dict(encoder_state_dict)
@@ -199,7 +535,17 @@ class Regressor(nn.Module):
         return regressor
 
     @classmethod
-    def create_from_state_dict(cls, state_dict):
+    def _detect_intrinsics_fusion_mode(cls, state_dict):
+        if any(k.startswith("intrinsics_fusion.mode_modules.film") for k in state_dict):
+            return "film"
+        if any(k.startswith("intrinsics_fusion.mode_modules.gated_add") for k in state_dict):
+            return "gated_add"
+        if any(k.startswith("intrinsics_fusion.mode_modules.concat_conv") for k in state_dict):
+            return "concat_conv"
+        return "add"
+
+    @classmethod
+    def create_from_state_dict(cls, state_dict, intrinsics_fusion_mode=None):
         """
         Instantiate a regressor from a pretrained state dictionary.
 
@@ -219,26 +565,54 @@ class Regressor(nn.Module):
         num_encoder_features = state_dict['encoder.res2_conv3.weight'].shape[0]
 
         # Create a regressor.
-        _logger.info(f"Creating regressor from pretrained state_dict:"
-                     f"\n\tNum head blocks: {num_head_blocks}"
-                     f"\n\tHomogeneous coordinates: {use_homogeneous}"
-                     f"\n\tEncoder feature size: {num_encoder_features}")
-        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features)
+        detected_mode = cls._detect_intrinsics_fusion_mode(state_dict)
+        fusion_mode = intrinsics_fusion_mode or detected_mode
+
+        _logger.info(
+            "Creating regressor from pretrained state_dict:\n\tNum head blocks: %s\n\tHomogeneous coordinates: %s\n\tEncoder feature size: %s\n\tIntrinsics fusion: %s",
+            num_head_blocks,
+            use_homogeneous,
+            num_encoder_features,
+            fusion_mode,
+        )
+
+        regressor = cls(mean, num_head_blocks, use_homogeneous, num_encoder_features, fusion_mode)
 
         # Load all weights.
-        regressor.load_state_dict(state_dict)
+        strict_load = not (intrinsics_fusion_mode and fusion_mode != detected_mode)
+        load_result = regressor.load_state_dict(state_dict, strict=strict_load)
+        if load_result.missing_keys:
+            _logger.debug("Missing keys while loading regressor: %s", load_result.missing_keys)
+        if load_result.unexpected_keys:
+            _logger.debug("Unexpected keys while loading regressor: %s", load_result.unexpected_keys)
 
         # Done.
         return regressor
 
     @classmethod
-    def create_from_split_state_dict(cls, encoder_state_dict, head_state_dict):
+    def create_from_split_state_dict(
+        cls,
+        encoder_state_dict,
+        head_state_dict,
+        intrinsics_fusion_mode=None,
+    ):
         """
         Instantiate a regressor from a pretrained encoder (scene-agnostic) and a scene-specific head.
 
         encoder_state_dict: encoder state dictionary
         head_state_dict: scene-specific head state dictionary
         """
+        # Extract heads and intrinsics fusion state dicts if they are stored separately.
+        saved_fusion_mode = None
+        intrinsics_state_dict = {}
+
+        if isinstance(head_state_dict, dict) and "heads" in head_state_dict:
+            saved_fusion_mode = head_state_dict.get("intrinsics_fusion_mode")
+            intrinsics_state_dict = head_state_dict.get("intrinsics_fusion", {})
+            head_state_dict = head_state_dict.get("heads", {})
+        elif isinstance(head_state_dict, dict):
+            saved_fusion_mode = head_state_dict.get("intrinsics_fusion_mode")
+
         # We simply merge the dictionaries and call the other constructor.
         merged_state_dict = {}
 
@@ -248,7 +622,15 @@ class Regressor(nn.Module):
         for k, v in head_state_dict.items():
             merged_state_dict[f"heads.{k}"] = v
 
-        return cls.create_from_state_dict(merged_state_dict)
+        for k, v in intrinsics_state_dict.items():
+            merged_state_dict[f"intrinsics_fusion.{k}"] = v
+
+        if intrinsics_fusion_mode == "auto":
+            intrinsics_fusion_mode = None
+
+        fusion_mode = intrinsics_fusion_mode or saved_fusion_mode
+
+        return cls.create_from_state_dict(merged_state_dict, fusion_mode)
 
     def load_encoder(self, encoder_dict_file):
         """
@@ -256,15 +638,16 @@ class Regressor(nn.Module):
         """
         self.encoder.load_state_dict(torch.load(encoder_dict_file))
 
-    def get_features(self, inputs):
-        return self.encoder(inputs)
+    def get_features(self, inputs, intrinsics=None):
+        features = self.encoder(inputs)
+        return self._fuse_intrinsics(features, intrinsics)
 
     def get_scene_coordinates(self, features):
         return self.heads(features)
 
-    def forward(self, inputs):
+    def forward(self, inputs, intrinsics=None):
         """
         Forward pass.
         """
-        features = self.get_features(inputs)
+        features = self.get_features(inputs, intrinsics)
         return self.get_scene_coordinates(features)

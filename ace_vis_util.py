@@ -427,7 +427,7 @@ def get_point_cloud_from_network(network, data_loader, filter_depth):
             K = K.cuda(non_blocking=True)
 
             with autocast():
-                scene_coords = network(image)
+                scene_coords = network(image, K)
 
             B, C, H, W = scene_coords.shape
 

@@ -267,6 +267,17 @@ We provide several scripts to run training and evaluation on the various dataset
 These allow replicating the results we showcased in the paper.
 They are located under the `scripts` folder: `scripts/train_*.sh`.
 
+In addition to the dataset-specific launchers, `scripts/train_intrinsics_fusion_sweep.sh` automates sequential
+training of the ACE head with every intrinsic fusion strategy. The script accepts the scene path, an output
+directory where the checkpoints will be stored, and forwards any additional arguments to `train_ace.py`. Each
+checkpoint is suffixed with the fusion mode it was trained with.
+
+The companion `scripts/test_intrinsics_fusion_sweep.sh` iterates over the generated checkpoints and runs
+`test_ace.py` for each model. By default it creates distinct session names based on the checkpoint suffix so the
+result logs do not overwrite one another. You can override the default session prefix by exporting
+`SESSION_PREFIX` before invoking the script or by passing an explicit `--session` argument that is then forwarded
+unchanged to `test_ace.py`.
+
 In the same folder we also provide scripts to generate videos of the training/testing protocol, as can be seen in the
 project page. They are under `scripts/viz_*.sh`.
 

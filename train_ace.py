@@ -49,6 +49,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--batch_size', type=int, default=5120,
                         help='number of patches for each parameter update (has to be a multiple of 512)')
+    parser.add_argument('--buffer_chunk_size', type=int, default=None,
+                        help='patches per buffer refill; defaults to ~2M so fusion updates feed the next chunk')
 
     parser.add_argument('--epochs', type=int, default=16,
                         help='number of runs through the training buffer')

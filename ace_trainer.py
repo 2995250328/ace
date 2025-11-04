@@ -1,6 +1,7 @@
 # Copyright © Niantic, Inc. 2022.
 
 import logging
+import math
 import random
 import time
 
@@ -116,9 +117,16 @@ class TrainerACE:
 
         # Buffer chunk configuration controls how often we refresh the feature buffer so that
         # newly optimised fusion weights are reflected in future training batches.
-        self.buffer_chunk_sizes = self._build_buffer_chunk_schedule(
-            getattr(self.options, "buffer_chunk_size", None)
-        )
+        preferred_chunk_size = getattr(self.options, "buffer_chunk_size", None)
+        self.auto_buffer_chunk_size = None
+        if preferred_chunk_size is None or preferred_chunk_size <= 0:
+            self.auto_buffer_chunk_size = self._recommend_buffer_chunk_size(
+                int(self.options.training_buffer_size),
+                int(self.options.batch_size),
+            )
+            preferred_chunk_size = self.auto_buffer_chunk_size
+
+        self.buffer_chunk_sizes = self._build_buffer_chunk_schedule(preferred_chunk_size)
         self.total_buffer_chunks = len(self.buffer_chunk_sizes)
 
         # Setup optimization parameters (only trainable parameters are included).
@@ -149,6 +157,15 @@ class TrainerACE:
         # Compute total number of iterations.
         self.iterations = self.options.epochs * steps_per_epoch
         self.iterations_output = 100 # print loss every n iterations, and (optionally) write a visualisation frame
+
+        if self.auto_buffer_chunk_size is not None:
+            _logger.info(
+                "Auto-selected buffer chunk size: %d (total buffer %d, batch %d, %d chunks per epoch)",
+                self.auto_buffer_chunk_size,
+                int(self.options.training_buffer_size),
+                int(self.options.batch_size),
+                self.total_buffer_chunks,
+            )
 
         if self.total_buffer_chunks > 1:
             preview_count = min(3, self.total_buffer_chunks)
@@ -193,7 +210,7 @@ class TrainerACE:
         batch = int(self.options.batch_size)
 
         if preferred_chunk_size is None or preferred_chunk_size <= 0:
-            preferred_chunk_size = total
+            preferred_chunk_size = self._recommend_buffer_chunk_size(total, batch)
 
         preferred_chunk_size = int(preferred_chunk_size)
         schedule = []
@@ -215,6 +232,20 @@ class TrainerACE:
                 schedule.append(total)
 
         return schedule
+
+    def _recommend_buffer_chunk_size(self, total_size, batch_size):
+        """Heuristic chunk sizing that keeps ~2M samples per refresh."""
+        target_features_per_chunk = 2_000_000
+
+        if total_size <= target_features_per_chunk:
+            return total_size
+
+        approx_chunks = max(1, math.ceil(total_size / target_features_per_chunk))
+        chunk_size = math.ceil(total_size / approx_chunks)
+
+        chunk_size = max(batch_size, math.ceil(chunk_size / batch_size) * batch_size)
+
+        return min(chunk_size, total_size)
 
     def train(self):
         """

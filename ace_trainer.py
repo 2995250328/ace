@@ -275,6 +275,8 @@ class TrainerACE:
             epoch_start_time = time.time()
             epoch_buffer_time = 0.
             epoch_training_time = 0.
+            # Iterate once for each planned buffer refill; chunk_idx therefore runs from
+            # 1..self.total_buffer_chunks (len(self.buffer_chunk_sizes)).
             for chunk_idx, chunk_size in enumerate(self.buffer_chunk_sizes, start=1):
                 buffer_start_time = time.time()
                 self.create_training_buffer(chunk_size, chunk_index=chunk_idx)
